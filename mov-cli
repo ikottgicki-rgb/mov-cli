@@ -279,7 +279,7 @@ def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
                 if found.get("stream"):
                     return
                 url = resp.url
-                if "master.m3u8" in url:
+                if ".m3u8" in url and resp.status == 200:
                     found["stream"] = url
                     return
                 ct = resp.headers.get("content-type", "")
@@ -288,15 +288,15 @@ def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
                         import json as _json
                         body = await resp.text()
                         d = _json.loads(body)
-                        # {"stream": "..."} format (tik.aether.mom)
-                        if d.get("stream"):
-                            found["stream"] = d["stream"]
-                            return
-                        # xpass.top playlist format
-                        for item in d.get("playlist", []):
+                        if isinstance(d, dict) and d.get("stream"):
+                            s = d["stream"]
+                            if s.startswith("http") and ".m3u8" in s:
+                                found["stream"] = s
+                                return
+                        for item in (d.get("playlist", []) if isinstance(d, dict) else []):
                             for src in item.get("sources", []):
                                 f = src.get("file", "")
-                                if f and f.startswith("http") and "error" not in f:
+                                if f and f.startswith("http") and ".m3u8" in f:
                                     found["stream"] = f
                                     return
                     except Exception:
@@ -374,7 +374,7 @@ def pipe_to_mpv(master_url, title, sub_file=None):
     _, port = start_proxy()
     proxied = f"http://127.0.0.1:{port}/master?url={urllib.parse.quote(master_url, safe='')}"
     print(f"\nPlaying: {title}")
-    cmd = ["mpv", proxied, "--cache=yes", "--demuxer-max-bytes=50MiB", f"--title={title}"]
+    cmd = ["mpv", proxied, "--cache=yes", "--demuxer-max-bytes=50MiB", "--no-ytdl", f"--title={title}"]
     if sub_file:
         cmd += [f"--sub-file={sub_file}"]
     subprocess.run(cmd)
