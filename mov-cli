@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import sys
-import os
 import json
 import re
 import socket
@@ -90,66 +89,56 @@ def free_port():
 
 class HLSProxy(BaseHTTPRequestHandler):
     def log_message(self, *args):
-        pass  # suppress access logs
+        pass
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
-
+        url = params.get("url", [""])[0]
         if parsed.path == "/master":
-            self._serve_master(params.get("url", [""])[0])
+            self._serve_m3u8(url, is_master=True)
         elif parsed.path == "/playlist":
-            self._serve_playlist(params.get("url", [""])[0])
+            self._serve_m3u8(url, is_master=False)
         elif parsed.path == "/seg":
-            self._serve_segment(params.get("url", [""])[0])
+            self._serve_segment(url)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
 
-    def _proxy_url(self, kind, url):
+    def _purl(self, kind, url):
         return f"http://127.0.0.1:{self.server.proxy_port}/{kind}?url={urllib.parse.quote(url, safe='')}"
 
-    def _serve_master(self, orig_url):
-        raw = fetch(orig_url, TIK_HEADERS)
-        if not raw:
-            self.send_response(502)
-            self.end_headers()
-            return
-        text = raw.decode()
-        # Rewrite playlist URLs to go through proxy
-        def rewrite(m):
-            return self._proxy_url("playlist", m.group(0))
-        text = re.sub(r"https://tik\.aether\.mom/\S+/playlist\.m3u8", rewrite, text)
-        body = text.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+    def _rewrite(self, text, base_url):
+        lines = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                lines.append(line)
+                continue
+            abs_url = s if s.startswith("http") else urllib.parse.urljoin(base_url, s)
+            if abs_url.split("?")[0].endswith(".m3u8"):
+                lines.append(self._purl("playlist", abs_url))
+            else:
+                lines.append(self._purl("seg", abs_url))
+        return "\n".join(lines)
 
-    def _serve_playlist(self, orig_url):
+    def _serve_m3u8(self, orig_url, is_master):
         raw = fetch(orig_url, TIK_HEADERS)
         if not raw:
-            self.send_response(502)
-            self.end_headers()
-            return
-        text = raw.decode()
-        seg_urls = re.findall(r"https://p\d+-[a-z]+\.tiktokcdn\.com/\S+", text)
-        # Prefetch first 8 segments in background
-        def prefetch(urls):
-            for u in urls[:8]:
-                with SEG_CACHE_LOCK:
-                    if u in SEG_CACHE:
-                        continue
-                png = fetch(u, SEG_HEADERS)
-                if png:
+            self.send_response(502); self.end_headers(); return
+        text = self._rewrite(raw.decode(), orig_url)
+        if not is_master:
+            seg_urls = [urllib.parse.parse_qs(urllib.parse.urlparse(l).query).get("url", [""])[0]
+                        for l in text.splitlines() if "/seg?" in l]
+            def prefetch(urls):
+                for u in urls[:8]:
                     with SEG_CACHE_LOCK:
-                        SEG_CACHE[u] = extract_ts_from_png(png)
-        threading.Thread(target=prefetch, args=(seg_urls,), daemon=True).start()
-        # Rewrite TikTok CDN segment URLs to go through proxy
-        def rewrite(m):
-            return self._proxy_url("seg", m.group(0))
-        text = re.sub(r"https://p\d+-[a-z]+\.tiktokcdn\.com/\S+", rewrite, text)
+                        if u in SEG_CACHE: continue
+                    data = fetch(u, SEG_HEADERS)
+                    if data:
+                        ts = extract_ts_from_png(data) if data[:4] == b"\x89PNG" else data
+                        with SEG_CACHE_LOCK:
+                            SEG_CACHE[u] = ts
+            threading.Thread(target=prefetch, args=(seg_urls,), daemon=True).start()
         body = text.encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -161,17 +150,14 @@ class HLSProxy(BaseHTTPRequestHandler):
         with SEG_CACHE_LOCK:
             ts_data = SEG_CACHE.get(orig_url)
         if ts_data is None:
-            png_data = fetch(orig_url, SEG_HEADERS)
-            if not png_data:
-                self.send_response(502)
-                self.end_headers()
-                return
-            ts_data = extract_ts_from_png(png_data)
+            data = fetch(orig_url, SEG_HEADERS)
+            if not data:
+                self.send_response(502); self.end_headers(); return
+            ts_data = extract_ts_from_png(data) if data[:4] == b"\x89PNG" else data
             with SEG_CACHE_LOCK:
                 SEG_CACHE[orig_url] = ts_data
-                if len(SEG_CACHE) > 30:
-                    oldest = next(iter(SEG_CACHE))
-                    del SEG_CACHE[oldest]
+                if len(SEG_CACHE) > 50:
+                    del SEG_CACHE[next(iter(SEG_CACHE))]
         self.send_response(200)
         self.send_header("Content-Type", "video/mp2t")
         self.send_header("Content-Length", len(ts_data))
@@ -264,7 +250,7 @@ def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
 
     async def run():
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False, args=["--window-size=800,500"])
+            browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
@@ -303,12 +289,12 @@ def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
             if media_type == "movie":
                 page_url = f"https://aether.mom/media/tmdb-movie-{tmdb_id}-{slug}"
             else:
-                page_url = f"https://aether.mom/media/tmdb-tv-{tmdb_id}-{slug}?episode.t={tmdb_id}&season.n={season}&episode.n={episode}"
+                page_url = f"https://aether.mom/media/tmdb-tv-{tmdb_id}-{slug}?season.n={season}&episode.n={episode}"
 
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=20000)
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
 
-            # Wait up to 20s for a stream to appear
-            for _ in range(20):
+            # Wait up to 35s for a stream to appear
+            for _ in range(35):
                 if found.get("stream"):
                     break
                 await asyncio.sleep(1)
@@ -319,8 +305,6 @@ def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
     return asyncio.run(run())
 
 
-FIFO_PATH = "/tmp/mov-cli-stream.ts"
-WYZIE_KEY = "wyzie-cc34cedc952f0bc1123e16b996f60157"
 SUB_PATH = "/tmp/mov-cli-sub.srt"
 
 
@@ -369,93 +353,10 @@ def pick_and_download_sub(subs):
 
 
 def pipe_to_mpv(master_url, title, sub_file=None):
-    # Fetch master playlist - try with tik headers first, fall back to plain
-    for hdrs in [TIK_HEADERS, SEG_HEADERS]:
-        raw = fetch(master_url, hdrs)
-        if raw:
-            break
-    if not raw:
-        print("Could not fetch stream.")
-        return
-    master = raw.decode()
-
-    # Find quality playlist URL
-    playlist_match = re.search(r"https://\S+/playlist\.m3u8", master)
-    if not playlist_match:
-        # master IS the playlist (no quality variants)
-        playlist_url = master_url
-        playlist = master
-    else:
-        playlist_url = playlist_match.group(0)
-        hdrs2 = TIK_HEADERS if "tik.aether.mom" in playlist_url else SEG_HEADERS
-        playlist = fetch(playlist_url, hdrs2).decode()
-
-    # Extract all segment URLs from playlist
-    all_segs = re.findall(r"https?://\S+", playlist)
-    all_segs = [s for s in all_segs if not s.endswith(".m3u8")]
-
-    if not all_segs:
-        print("No segments found.")
-        return
-
-    # Check if segments are PNG-wrapped (peek at first segment's magic bytes)
-    first_seg = fetch(all_segs[0], SEG_HEADERS, timeout=8)
-    is_png = first_seg[:4] == b"\x89PNG"
-
-    if not is_png:
-        # Standard HLS — pass directly to mpv with Origin header
-        print(f"\nPlaying: {title}")
-        cmd = [
-            "mpv", master_url,
-            "--cache=yes", "--demuxer-max-bytes=50MiB",
-            "--http-header-fields=Origin: https://aether.mom",
-            f"--referrer=https://aether.mom/",
-            f"--title={title}",
-        ]
-        if sub_file:
-            cmd += [f"--sub-file={sub_file}"]
-        subprocess.run(cmd)
-        return
-
-    seg_urls = all_segs
-    print(f"\nPlaying: {title}  ({len(seg_urls)} segments, ~{len(seg_urls)*2//60}min)")
-
-    # Create FIFO so mpv's stdin stays attached to the terminal (keyboard works)
-    if os.path.exists(FIFO_PATH):
-        os.remove(FIFO_PATH)
-    os.mkfifo(FIFO_PATH)
-
-    import queue as _queue
-    q = _queue.Queue(maxsize=8)
-
-    def fetcher():
-        for url in seg_urls:
-            png = fetch(url, SEG_HEADERS)
-            q.put(extract_ts_from_png(png) if png else b"")
-        q.put(None)
-
-    threading.Thread(target=fetcher, daemon=True).start()
-
-    def writer():
-        try:
-            with open(FIFO_PATH, "wb") as f:
-                while True:
-                    ts = q.get()
-                    if ts is None:
-                        break
-                    f.write(ts)
-                    f.flush()
-        except BrokenPipeError:
-            pass
-        finally:
-            try:
-                os.remove(FIFO_PATH)
-            except Exception:
-                pass
-
-    threading.Thread(target=writer, daemon=True).start()
-
-    cmd = ["mpv", FIFO_PATH, "--cache=yes", "--demuxer-max-bytes=50MiB", f"--title={title}"]
+    _, port = start_proxy()
+    proxied = f"http://127.0.0.1:{port}/master?url={urllib.parse.quote(master_url, safe='')}"
+    print(f"\nPlaying: {title}")
+    cmd = ["mpv", proxied, "--cache=yes", "--demuxer-max-bytes=50MiB", f"--title={title}"]
     if sub_file:
         cmd += [f"--sub-file={sub_file}"]
     subprocess.run(cmd)
