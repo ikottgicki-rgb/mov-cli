@@ -143,7 +143,11 @@ class HLSProxy(BaseHTTPRequestHandler):
         raw = fetch(orig_url, STREAM_HEADERS)
         if not raw:
             self.send_response(502); self.end_headers(); return
-        text = self._rewrite(raw.decode(), orig_url)
+        decoded = raw.decode()
+        # Force VOD behaviour: inject #EXT-X-ENDLIST if missing on media playlists
+        if not is_master and "#EXT-X-ENDLIST" not in decoded and "#EXTINF" in decoded:
+            decoded = decoded.rstrip() + "\n#EXT-X-ENDLIST\n"
+        text = self._rewrite(decoded, orig_url)
         if not is_master:
             seg_urls = [urllib.parse.parse_qs(urllib.parse.urlparse(l).query).get("url", [""])[0]
                         for l in text.splitlines() if "/seg?" in l]
@@ -376,52 +380,12 @@ def pick_and_download_sub(subs):
     return SUB_PATH
 
 
-def _first_segment_url(master_url):
-    """Return the URL of the first media segment in the stream."""
-    raw = fetch(master_url, STREAM_HEADERS)
-    if not raw:
-        return None, raw
-    text = raw.decode(errors="ignore")
-    # Walk quality variant playlists
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("http") and s.endswith(".m3u8"):
-            praw = fetch(s, STREAM_HEADERS)
-            if praw:
-                for pl in praw.decode(errors="ignore").splitlines():
-                    ps = pl.strip()
-                    if ps.startswith("http") and not ps.endswith(".m3u8"):
-                        return ps, raw
-    # master IS the playlist
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("http") and not s.endswith(".m3u8"):
-            return s, raw
-    return None, raw
-
 
 def pipe_to_mpv(master_url, title, sub_file=None):
-    seg_url, _ = _first_segment_url(master_url)
-    is_png = False
-    if seg_url:
-        first = fetch(seg_url, STREAM_HEADERS, timeout=8)
-        is_png = first[:4] == b"\x89PNG"
-
+    _, port = start_proxy()
+    proxied = f"http://127.0.0.1:{port}/master?url={urllib.parse.quote(master_url, safe='')}"
     print(f"\nPlaying: {title}")
-    if is_png:
-        # TikTok CDN PNG-wrapped segments — must go through proxy
-        _, port = start_proxy()
-        proxied = f"http://127.0.0.1:{port}/master?url={urllib.parse.quote(master_url, safe='')}"
-        cmd = ["mpv", proxied, "--cache=yes", "--demuxer-max-bytes=8MiB", "--no-ytdl", f"--title={title}"]
-    else:
-        # Standard HLS — let mpv handle natively (proper seeking support)
-        cmd = [
-            "mpv", master_url,
-            "--http-header-fields=Origin: https://aether.mom",
-            "--referrer=https://aether.mom/",
-            "--no-ytdl",
-            f"--title={title}",
-        ]
+    cmd = ["mpv", proxied, "--cache=yes", "--demuxer-max-bytes=8MiB", "--no-ytdl", f"--title={title}"]
     if sub_file:
         cmd += [f"--sub-file={sub_file}"]
     subprocess.run(cmd)
