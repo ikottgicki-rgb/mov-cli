@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import re
+import socket
+import subprocess
+import threading
+import urllib.parse
+import socket as _socket
+import requests as _requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+# Force IPv4 — IPv6 on this machine hangs for ~80s before falling back
+_orig_getaddrinfo = _socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, *a, **kw):
+    return _orig_getaddrinfo(host, port, _socket.AF_INET, *a, **kw)
+_socket.getaddrinfo = _ipv4_getaddrinfo
+
+SEG_CACHE = {}
+SEG_CACHE_LOCK = threading.Lock()
+
+_session = _requests.Session()
+_session.mount("https://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=0.3)))
+_session.mount("http://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=0.3)))
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+TMDB_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1YjEwYWNhZDFhNjY3ZTQwMDEyMGVjMTc1ZDBjZTFmZCIsIm5iZiI6MTcyNDk1Mjg3MC45NDA4NDcsInN1YiI6IjY2ZDBhOTgyODQ1OWYzM2FmMjBmYjdkNSIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.ScGHs1VZTLGpUKWPG7EA-2T29OPcqW_qpJjKL5Yhrjc"
+
+TIK_HEADERS = {
+    "Origin": "https://aether.mom",
+    "Referer": "https://aether.mom/",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+}
+
+TMDB_HEADERS = {
+    "Authorization": f"Bearer {TMDB_TOKEN}",
+    "Accept": "application/json",
+}
+
+SEG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+
+def fetch(url, headers, timeout=8):
+    try:
+        r = _session.get(url, headers=headers, timeout=(5, timeout))
+        if not r.ok:
+            print(f"HTTP {r.status_code}: {url}", file=sys.stderr)
+            return b""
+        return r.content
+    except Exception as e:
+        print(f"Fetch error: {e}", file=sys.stderr)
+        return b""
+
+
+def fetch_json(url, headers):
+    data = fetch(url, headers)
+    try:
+        return json.loads(data) if data else {}
+    except Exception:
+        return {}
+
+
+def extract_ts_from_png(data):
+    """Extract MPEG-TS payload hidden after IEND chunk in a PNG."""
+    iend = data.find(b"IEND")
+    if iend < 0:
+        return data
+    return data[iend + 8:]
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class HLSProxy(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # suppress access logs
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path == "/master":
+            self._serve_master(params.get("url", [""])[0])
+        elif parsed.path == "/playlist":
+            self._serve_playlist(params.get("url", [""])[0])
+        elif parsed.path == "/seg":
+            self._serve_segment(params.get("url", [""])[0])
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _proxy_url(self, kind, url):
+        return f"http://127.0.0.1:{self.server.proxy_port}/{kind}?url={urllib.parse.quote(url, safe='')}"
+
+    def _serve_master(self, orig_url):
+        raw = fetch(orig_url, TIK_HEADERS)
+        if not raw:
+            self.send_response(502)
+            self.end_headers()
+            return
+        text = raw.decode()
+        # Rewrite playlist URLs to go through proxy
+        def rewrite(m):
+            return self._proxy_url("playlist", m.group(0))
+        text = re.sub(r"https://tik\.aether\.mom/\S+/playlist\.m3u8", rewrite, text)
+        body = text.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_playlist(self, orig_url):
+        raw = fetch(orig_url, TIK_HEADERS)
+        if not raw:
+            self.send_response(502)
+            self.end_headers()
+            return
+        text = raw.decode()
+        seg_urls = re.findall(r"https://p\d+-[a-z]+\.tiktokcdn\.com/\S+", text)
+        # Prefetch first 8 segments in background
+        def prefetch(urls):
+            for u in urls[:8]:
+                with SEG_CACHE_LOCK:
+                    if u in SEG_CACHE:
+                        continue
+                png = fetch(u, SEG_HEADERS)
+                if png:
+                    with SEG_CACHE_LOCK:
+                        SEG_CACHE[u] = extract_ts_from_png(png)
+        threading.Thread(target=prefetch, args=(seg_urls,), daemon=True).start()
+        # Rewrite TikTok CDN segment URLs to go through proxy
+        def rewrite(m):
+            return self._proxy_url("seg", m.group(0))
+        text = re.sub(r"https://p\d+-[a-z]+\.tiktokcdn\.com/\S+", rewrite, text)
+        body = text.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_segment(self, orig_url):
+        with SEG_CACHE_LOCK:
+            ts_data = SEG_CACHE.get(orig_url)
+        if ts_data is None:
+            png_data = fetch(orig_url, SEG_HEADERS)
+            if not png_data:
+                self.send_response(502)
+                self.end_headers()
+                return
+            ts_data = extract_ts_from_png(png_data)
+            with SEG_CACHE_LOCK:
+                SEG_CACHE[orig_url] = ts_data
+                if len(SEG_CACHE) > 30:
+                    oldest = next(iter(SEG_CACHE))
+                    del SEG_CACHE[oldest]
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Length", len(ts_data))
+        self.end_headers()
+        self.wfile.write(ts_data)
+
+
+def start_proxy():
+    port = free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), HLSProxy)
+    server.proxy_port = port
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, port
+
+
+def tmdb_search(query):
+    q = urllib.parse.quote(query)
+    results_box = {}
+
+    def fetch_movies():
+        results_box["movies"] = fetch_json(
+            f"https://api.themoviedb.org/3/search/movie?query={q}&language=en-US&page=1",
+            TMDB_HEADERS,
+        ).get("results", [])
+
+    def fetch_shows():
+        results_box["shows"] = fetch_json(
+            f"https://api.themoviedb.org/3/search/tv?query={q}&language=en-US&page=1",
+            TMDB_HEADERS,
+        ).get("results", [])
+
+    t1 = threading.Thread(target=fetch_movies)
+    t2 = threading.Thread(target=fetch_shows)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    movies = results_box.get("movies", [])
+    shows = results_box.get("shows", [])
+
+    results = []
+    for m in movies[:12]:
+        year = m.get("release_date", "")[:4] or "?"
+        results.append({
+            "type": "movie",
+            "id": m["id"],
+            "display": f"[Movie] {m['title']} ({year})",
+        })
+    for s in shows[:8]:
+        year = s.get("first_air_date", "")[:4] or "?"
+        results.append({
+            "type": "tv",
+            "id": s["id"],
+            "display": f"[TV]    {s['name']} ({year})",
+        })
+    return results
+
+
+def fzf(options, prompt):
+    proc = subprocess.run(
+        ["fzf", "--prompt", prompt, "--height=~40%", "--layout=reverse", "--border"],
+        input="\n".join(options),
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def get_stream(media_type, tmdb_id, season=None, episode=None, slug=""):
+    # Primary: tik.aether.mom direct API
+    if media_type == "movie":
+        url = f"https://tik.aether.mom/movie/{tmdb_id}"
+    else:
+        url = f"https://tik.aether.mom/tv/{tmdb_id}/{season}/{episode}"
+    data = fetch_json(url, TIK_HEADERS)
+    stream = data.get("stream")
+    if stream:
+        return stream
+
+    # Fallback: Playwright — lets all aether.mom browser scrapers run
+    print("Primary source unavailable, trying fallback sources (this may take ~15s)...")
+    return get_stream_playwright(media_type, tmdb_id, season, episode, slug)
+
+
+def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return None
+
+    async def run():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False, args=["--window-size=800,500"])
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            found = {}
+
+            async def on_response(resp):
+                if found.get("stream"):
+                    return
+                url = resp.url
+                if "master.m3u8" in url:
+                    found["stream"] = url
+                    return
+                ct = resp.headers.get("content-type", "")
+                if "json" in ct:
+                    try:
+                        import json as _json
+                        body = await resp.text()
+                        d = _json.loads(body)
+                        # {"stream": "..."} format (tik.aether.mom)
+                        if d.get("stream"):
+                            found["stream"] = d["stream"]
+                            return
+                        # xpass.top playlist format
+                        for item in d.get("playlist", []):
+                            for src in item.get("sources", []):
+                                f = src.get("file", "")
+                                if f and f.startswith("http") and "error" not in f:
+                                    found["stream"] = f
+                                    return
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+
+            if media_type == "movie":
+                page_url = f"https://aether.mom/media/tmdb-movie-{tmdb_id}-{slug}"
+            else:
+                page_url = f"https://aether.mom/media/tmdb-tv-{tmdb_id}-{slug}?episode.t={tmdb_id}&season.n={season}&episode.n={episode}"
+
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=20000)
+
+            # Wait up to 20s for a stream to appear
+            for _ in range(20):
+                if found.get("stream"):
+                    break
+                await asyncio.sleep(1)
+
+            await browser.close()
+            return found.get("stream")
+
+    return asyncio.run(run())
+
+
+FIFO_PATH = "/tmp/mov-cli-stream.ts"
+WYZIE_KEY = "wyzie-cc34cedc952f0bc1123e16b996f60157"
+SUB_PATH = "/tmp/mov-cli-sub.srt"
+
+
+OSUB_HEADERS = {"X-User-Agent": "TemporaryUserAgent", "User-Agent": "Mozilla/5.0"}
+
+
+def fetch_subtitles(imdb_id, season=None, episode=None):
+    # Strip "tt" prefix if present, pad to 7 digits
+    num = imdb_id.lstrip("t") if imdb_id else ""
+    url = f"https://rest.opensubtitles.org/search/imdbid-{num}/sublanguageid-eng"
+    if season:
+        url += f"/season-{season}/episode-{episode}"
+    data = fetch_json(url, OSUB_HEADERS)
+    if not isinstance(data, list):
+        return []
+    subs = [s for s in data if s.get("SubFormat", "").lower() == "srt"]
+    subs.sort(key=lambda s: int(s.get("SubDownloadsCnt", 0)), reverse=True)
+    return subs
+
+
+def pick_and_download_sub(subs):
+    if not subs:
+        print("No subtitles found.")
+        return None
+    displays = [f"{s['SubFileName']}  ({s.get('SubDownloadsCnt','?')} dl)" for s in subs[:20]]
+    displays.insert(0, "-- No subtitles --")
+    sel = fzf(displays, "Subtitles: ")
+    if not sel or sel == "-- No subtitles --":
+        return None
+    idx = displays.index(sel) - 1
+    sub_url = subs[idx].get("SubDownloadLink")
+    if not sub_url:
+        return None
+    data = fetch(sub_url, OSUB_HEADERS)
+    if not data:
+        return None
+    # OpenSubtitles returns gzipped srt
+    import gzip
+    try:
+        data = gzip.decompress(data)
+    except Exception:
+        pass
+    with open(SUB_PATH, "wb") as f:
+        f.write(data)
+    return SUB_PATH
+
+
+def pipe_to_mpv(master_url, title, sub_file=None):
+    # Fetch master playlist - try with tik headers first, fall back to plain
+    for hdrs in [TIK_HEADERS, SEG_HEADERS]:
+        raw = fetch(master_url, hdrs)
+        if raw:
+            break
+    if not raw:
+        print("Could not fetch stream.")
+        return
+    master = raw.decode()
+
+    # Find quality playlist URL
+    playlist_match = re.search(r"https://\S+/playlist\.m3u8", master)
+    if not playlist_match:
+        # master IS the playlist (no quality variants)
+        playlist_url = master_url
+        playlist = master
+    else:
+        playlist_url = playlist_match.group(0)
+        hdrs2 = TIK_HEADERS if "tik.aether.mom" in playlist_url else SEG_HEADERS
+        playlist = fetch(playlist_url, hdrs2).decode()
+
+    # Extract all segment URLs from playlist
+    all_segs = re.findall(r"https?://\S+", playlist)
+    all_segs = [s for s in all_segs if not s.endswith(".m3u8")]
+
+    if not all_segs:
+        print("No segments found.")
+        return
+
+    # Check if segments are PNG-wrapped (peek at first segment's magic bytes)
+    first_seg = fetch(all_segs[0], SEG_HEADERS, timeout=8)
+    is_png = first_seg[:4] == b"\x89PNG"
+
+    if not is_png:
+        # Standard HLS — pass directly to mpv with Origin header
+        print(f"\nPlaying: {title}")
+        cmd = [
+            "mpv", master_url,
+            "--cache=yes", "--demuxer-max-bytes=50MiB",
+            "--http-header-fields=Origin: https://aether.mom",
+            f"--referrer=https://aether.mom/",
+            f"--title={title}",
+        ]
+        if sub_file:
+            cmd += [f"--sub-file={sub_file}"]
+        subprocess.run(cmd)
+        return
+
+    seg_urls = all_segs
+    print(f"\nPlaying: {title}  ({len(seg_urls)} segments, ~{len(seg_urls)*2//60}min)")
+
+    # Create FIFO so mpv's stdin stays attached to the terminal (keyboard works)
+    if os.path.exists(FIFO_PATH):
+        os.remove(FIFO_PATH)
+    os.mkfifo(FIFO_PATH)
+
+    import queue as _queue
+    q = _queue.Queue(maxsize=8)
+
+    def fetcher():
+        for url in seg_urls:
+            png = fetch(url, SEG_HEADERS)
+            q.put(extract_ts_from_png(png) if png else b"")
+        q.put(None)
+
+    threading.Thread(target=fetcher, daemon=True).start()
+
+    def writer():
+        try:
+            with open(FIFO_PATH, "wb") as f:
+                while True:
+                    ts = q.get()
+                    if ts is None:
+                        break
+                    f.write(ts)
+                    f.flush()
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                os.remove(FIFO_PATH)
+            except Exception:
+                pass
+
+    threading.Thread(target=writer, daemon=True).start()
+
+    cmd = ["mpv", FIFO_PATH, "--cache=yes", "--demuxer-max-bytes=50MiB", f"--title={title}"]
+    if sub_file:
+        cmd += [f"--sub-file={sub_file}"]
+    subprocess.run(cmd)
+
+
+def play(stream_url, title, sub_file=None):
+    pipe_to_mpv(stream_url, title, sub_file)
+
+
+def main():
+    query = " ".join(sys.argv[1:]).strip()
+    if not query:
+        try:
+            query = input("Search movies/shows: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+    if not query:
+        sys.exit(0)
+
+    print(f"Searching for '{query}'...")
+    results = tmdb_search(query)
+    if not results:
+        print("No results found.")
+        sys.exit(1)
+
+    displays = [r["display"] for r in results]
+    selected = fzf(displays, "Select: ")
+    if not selected:
+        sys.exit(0)
+
+    item = next((r for r in results if r["display"] == selected), None)
+    if not item:
+        sys.exit(1)
+
+    if item["type"] == "tv":
+        show_info = fetch_json(
+            f"https://api.themoviedb.org/3/tv/{item['id']}",
+            TMDB_HEADERS,
+        )
+        imdb_id = show_info.get("external_ids", {}).get("imdb_id") or \
+                  fetch_json(f"https://api.themoviedb.org/3/tv/{item['id']}/external_ids", TMDB_HEADERS).get("imdb_id")
+        seasons = [s for s in show_info.get("seasons", []) if s["season_number"] > 0]
+        if not seasons:
+            print("No seasons found.")
+            sys.exit(1)
+
+        season_displays = [
+            f"Season {s['season_number']:2d}  ({s['episode_count']} episodes)"
+            for s in seasons
+        ]
+        sel_season = fzf(season_displays, "Season: ")
+        if not sel_season:
+            sys.exit(0)
+        season_num = int(sel_season.split()[1])
+
+        season_info = fetch_json(
+            f"https://api.themoviedb.org/3/tv/{item['id']}/season/{season_num}",
+            TMDB_HEADERS,
+        )
+        episodes = season_info.get("episodes", [])
+        if not episodes:
+            print("No episodes found.")
+            sys.exit(1)
+
+        ep_displays = [f"E{e['episode_number']:02d}  {e['name']}" for e in episodes]
+        sel_ep = fzf(ep_displays, "Episode: ")
+        if not sel_ep:
+            sys.exit(0)
+        ep_num = int(sel_ep[1:3])
+
+        title = f"{selected.split('] ')[1]} S{season_num:02d}E{ep_num:02d}"
+        slug = re.sub(r"[^a-z0-9]+", "-", item["display"].split("] ")[1].split(" (")[0].lower()).strip("-")
+        print("Fetching stream + subtitles...")
+        box = {}
+        def _stream(): box["stream"] = get_stream("tv", item["id"], season_num, ep_num, slug)
+        def _subs(): box["subs"] = fetch_subtitles(imdb_id, season_num, ep_num) if imdb_id else []
+        ts, ss = threading.Thread(target=_stream), threading.Thread(target=_subs)
+        ts.start(); ss.start(); ts.join(); ss.join()
+        stream, subs = box.get("stream"), box.get("subs", [])
+    else:
+        movie_info = fetch_json(
+            f"https://api.themoviedb.org/3/movie/{item['id']}",
+            TMDB_HEADERS,
+        )
+        imdb_id = movie_info.get("imdb_id")
+        title = selected.split("] ")[1]
+        slug = re.sub(r"[^a-z0-9]+", "-", title.split(" (")[0].lower()).strip("-")
+        print("Fetching stream + subtitles...")
+        box = {}
+        def _stream(): box["stream"] = get_stream("movie", item["id"], slug=slug)
+        def _subs(): box["subs"] = fetch_subtitles(imdb_id) if imdb_id else []
+        ts, ss = threading.Thread(target=_stream), threading.Thread(target=_subs)
+        ts.start(); ss.start(); ts.join(); ss.join()
+        stream, subs = box.get("stream"), box.get("subs", [])
+
+    if not stream:
+        print("No stream available.")
+        sys.exit(1)
+
+    sub_file = pick_and_download_sub(subs)
+    play(stream, title, sub_file)
+
+
+if __name__ == "__main__":
+    main()
