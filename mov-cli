@@ -176,8 +176,9 @@ class HLSProxy(BaseHTTPRequestHandler):
                 SEG_CACHE[orig_url] = ts_data
                 if len(SEG_CACHE) > 50:
                     del SEG_CACHE[next(iter(SEG_CACHE))]
+        ct = "video/mp2t" if ts_data[:1] == b"\x47" else "video/mp4"
         self.send_response(200)
-        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Type", ct)
         self.send_header("Content-Length", len(ts_data))
         self.end_headers()
         self.wfile.write(ts_data)
@@ -379,7 +380,7 @@ def pipe_to_mpv(master_url, title, sub_file=None):
     _, port = start_proxy()
     proxied = f"http://127.0.0.1:{port}/master?url={urllib.parse.quote(master_url, safe='')}"
     print(f"\nPlaying: {title}")
-    cmd = ["mpv", proxied, "--cache=no", "--no-ytdl", "--force-seekable=yes", f"--title={title}"]
+    cmd = ["mpv", proxied, "--cache=yes", "--demuxer-max-bytes=8MiB", "--no-ytdl", f"--title={title}"]
     if sub_file:
         cmd += [f"--sub-file={sub_file}"]
     subprocess.run(cmd)
