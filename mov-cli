@@ -118,8 +118,19 @@ class HLSProxy(BaseHTTPRequestHandler):
         lines = []
         for line in text.splitlines():
             s = line.strip()
-            if not s or s.startswith("#"):
+            if not s:
                 lines.append(line)
+                continue
+            if s.startswith("#"):
+                # Rewrite URI="..." inside tags like #EXT-X-MAP and #EXT-X-KEY
+                if 'URI="' in s:
+                    def replace_uri(m):
+                        u = m.group(1)
+                        abs_u = u if u.startswith("http") else urllib.parse.urljoin(base_url, u)
+                        return f'URI="{self._purl("seg", abs_u)}"'
+                    lines.append(re.sub(r'URI="([^"]+)"', replace_uri, s))
+                else:
+                    lines.append(line)
                 continue
             abs_url = s if s.startswith("http") else urllib.parse.urljoin(base_url, s)
             if abs_url.split("?")[0].endswith(".m3u8"):
