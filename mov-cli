@@ -50,8 +50,15 @@ SEG_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
+STREAM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Origin": "https://aether.mom",
+    "Referer": "https://aether.mom/",
+    "Accept": "*/*",
+}
 
-def fetch(url, headers, timeout=8):
+
+def fetch(url, headers, timeout=15):
     try:
         r = _session.get(url, headers=headers, timeout=(5, timeout))
         if not r.ok:
@@ -122,7 +129,7 @@ class HLSProxy(BaseHTTPRequestHandler):
         return "\n".join(lines)
 
     def _serve_m3u8(self, orig_url, is_master):
-        raw = fetch(orig_url, TIK_HEADERS)
+        raw = fetch(orig_url, STREAM_HEADERS)
         if not raw:
             self.send_response(502); self.end_headers(); return
         text = self._rewrite(raw.decode(), orig_url)
@@ -133,7 +140,7 @@ class HLSProxy(BaseHTTPRequestHandler):
                 for u in urls[:8]:
                     with SEG_CACHE_LOCK:
                         if u in SEG_CACHE: continue
-                    data = fetch(u, SEG_HEADERS)
+                    data = fetch(u, STREAM_HEADERS)
                     if data:
                         ts = extract_ts_from_png(data) if data[:4] == b"\x89PNG" else data
                         with SEG_CACHE_LOCK:
@@ -150,7 +157,7 @@ class HLSProxy(BaseHTTPRequestHandler):
         with SEG_CACHE_LOCK:
             ts_data = SEG_CACHE.get(orig_url)
         if ts_data is None:
-            data = fetch(orig_url, SEG_HEADERS)
+            data = fetch(orig_url, STREAM_HEADERS)
             if not data:
                 self.send_response(502); self.end_headers(); return
             ts_data = extract_ts_from_png(data) if data[:4] == b"\x89PNG" else data
