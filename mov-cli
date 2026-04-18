@@ -311,11 +311,16 @@ def get_stream_playwright(media_type, tmdb_id, season, episode, slug=""):
 
             await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
 
-            # Wait up to 35s for a stream to appear
-            for _ in range(35):
+            # Wait up to 35s, showing a progress bar
+            total = 35
+            for i in range(total):
                 if found.get("stream"):
                     break
+                filled = int(30 * i / total)
+                bar = "#" * filled + "-" * (30 - filled)
+                print(f"\r  Scanning sources [{bar}] {i+1}/{total}s", end="", flush=True)
                 await asyncio.sleep(1)
+            print()  # newline after bar
 
             await browser.close()
             return found.get("stream")
