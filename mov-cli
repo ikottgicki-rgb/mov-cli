@@ -133,6 +133,9 @@ class HLSProxy(BaseHTTPRequestHandler):
                     lines.append(line)
                 continue
             abs_url = s if s.startswith("http") else urllib.parse.urljoin(base_url, s)
+            if not abs_url.startswith("http"):
+                lines.append(line)
+                continue
             if abs_url.split("?")[0].endswith(".m3u8"):
                 lines.append(self._purl("playlist", abs_url))
             else:
@@ -340,12 +343,17 @@ OSUB_HEADERS = {"X-User-Agent": "TemporaryUserAgent", "User-Agent": "Mozilla/5.0
 
 
 def fetch_subtitles(imdb_id, season=None, episode=None):
-    # Strip "tt" prefix if present, pad to 7 digits
     num = imdb_id.lstrip("t") if imdb_id else ""
+    if not num:
+        return []
     url = f"https://rest.opensubtitles.org/search/imdbid-{num}/sublanguageid-eng"
     if season:
         url += f"/season-{season}/episode-{episode}"
-    data = fetch_json(url, OSUB_HEADERS)
+    try:
+        r = _requests.get(url, headers=OSUB_HEADERS, timeout=(5, 10), allow_redirects=False)
+        data = r.json() if r.ok else []
+    except Exception:
+        return []
     if not isinstance(data, list):
         return []
     subs = [s for s in data if s.get("SubFormat", "").lower() == "srt"]
